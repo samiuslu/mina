@@ -8,13 +8,6 @@ open Mina_base.Rpc_intf
 type ('q, 'r) dispatch =
   Versioned_rpc.Connection_with_menu.t -> 'q -> 'r Deferred.Or_error.t
 
-module Connection_with_state = struct
-  type t = Banned | Allowed of Rpc.Connection.t Ivar.t
-
-  let value_map ~when_allowed ~when_banned t =
-    match t with Allowed c -> when_allowed c | _ -> when_banned
-end
-
 module Config = struct
   type t =
     { timeout : Time.Span.t
@@ -66,14 +59,15 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
     type t =
       { config : Config.t
       ; mutable added_seeds : Peer.Hash_set.t
-      ; net2 : Mina_net2.t Deferred.t ref
+      ; mutable net2 : Mina_net2.t Deferred.t
+      ; mutable connection_gating : Mina_net2.connection_gating
+      ; mutable subscription :
+          Message.msg Mina_net2.Pubsub.subscription Deferred.t
       ; first_peer_ivar : unit Ivar.t
       ; high_connectivity_ivar : unit Ivar.t
-      ; ban_reader : Intf.ban_notification Linear_pipe.Reader.t
       ; message_reader :
           (Message.msg Envelope.Incoming.t * Mina_net2.Validation_callback.t)
           Strict_pipe.Reader.t
-      ; subscription : Message.msg Mina_net2.Pubsub.subscription Deferred.t ref
       ; restart_helper : unit -> unit
       }
 
@@ -136,10 +130,31 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
 
     let peers_snapshot_max_staleness = Time.Span.of_sec 30.
 
+    let ban_peer t peer =
+      let%bind net2 = t.net2 in
+      t.connection_gating <-
+        { t.connection_gating with
+          banned_peers = peer :: t.connection_gating.banned_peers
+        } ;
+      Deferred.ignore_m
+        (Mina_net2.set_connection_gating_config net2 t.connection_gating)
+
+    let unban_peer t peer =
+      let%bind net2 = t.net2 in
+      t.connection_gating <-
+        { t.connection_gating with
+          banned_peers =
+            List.filter t.connection_gating.banned_peers ~f:(fun p ->
+                not (Peer.equal p peer))
+        } ;
+      Deferred.ignore_m
+        (Mina_net2.set_connection_gating_config net2 t.connection_gating)
+
     (* Creates just the helper, making sure to register everything
        BEFORE we start listening/advertise ourselves for discovery. *)
     let create_libp2p (config : Config.t) rpc_handlers first_peer_ivar
-        high_connectivity_ivar ~added_seeds ~pids ~on_unexpected_termination =
+        high_connectivity_ivar ~initial_gating_config ~added_seeds ~pids
+        ~on_unexpected_termination =
       let ctr = ref 0 in
       let record_peer_connection () =
         [%log' trace config.logger] "Fired peer_connected callback" ;
@@ -246,21 +261,7 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
                 ~min_connections:config.min_connections
                 ~max_connections:config.max_connections
                 ~validation_queue_size:config.validation_queue_size
-                ~initial_gating_config:
-                  Mina_net2.
-                    { banned_peers =
-                        Trust_system.peer_statuses config.trust_system
-                        |> List.filter_map ~f:(fun (peer, status) ->
-                               match status.banned with
-                               | Banned_until _ ->
-                                   Some peer
-                               | _ ->
-                                   None)
-                    ; trusted_peers =
-                        List.filter_map ~f:Mina_net2.Multiaddr.to_peer
-                          config.initial_peers
-                    ; isolate = config.isolate
-                    }
+                ~initial_gating_config
             in
             let implementation_list =
               List.bind rpc_handlers ~f:create_rpc_implementations
@@ -434,27 +435,54 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
       | Error e ->
           fail (Error.of_exn e)
 
-    let peers t = !(t.net2) >>= Mina_net2.peers
+    let peers t = t.net2 >>= Mina_net2.peers
 
-    let bandwidth_info t = !(t.net2) >>= Mina_net2.bandwidth_info
+    let bandwidth_info t = t.net2 >>= Mina_net2.bandwidth_info
 
     let create (config : Config.t) ~pids rpc_handlers =
-      let first_peer_ivar = Ivar.create () in
-      let high_connectivity_ivar = Ivar.create () in
+      let initial_bans =
+        Trust_system.peer_statuses config.trust_system
+        |> List.filter_map ~f:(function
+             | ( peer
+               , { banned = Trust_system.Banned_status.Banned_until expiration
+                 ; _
+                 } ) ->
+                 Some (peer, expiration)
+             | _ ->
+                 None)
+      in
+      let initial_connection_gating =
+        { Mina_net2.banned_peers =
+            List.map initial_bans ~f:(fun (peer, _) -> peer)
+        ; trusted_peers =
+            List.filter_map ~f:Mina_net2.Multiaddr.to_peer config.initial_peers
+        ; isolate = config.isolate
+        }
+      in
       let message_reader, message_writer =
         Strict_pipe.create ~name:"libp2p_messages" Synchronous
       in
-      let net2_ref = ref (Deferred.never ()) in
-      let subscription_ref = ref (Deferred.never ()) in
       let restarts_r, restarts_w =
         Strict_pipe.create ~name:"libp2p-restarts"
           (Strict_pipe.Buffered
              (`Capacity 0, `Overflow (Strict_pipe.Drop_head ignore)))
       in
       let added_seeds = Peer.Hash_set.create () in
-      let%bind () =
+      let t =
+        { config
+        ; added_seeds
+        ; net2 = Deferred.never ()
+        ; subscription = Deferred.never ()
+        ; connection_gating = initial_connection_gating
+        ; first_peer_ivar = Ivar.create ()
+        ; high_connectivity_ivar = Ivar.create ()
+        ; message_reader
+        ; restart_helper = (fun () -> Strict_pipe.Writer.write restarts_w ())
+        }
+      in
+      let%map () =
         let rec on_libp2p_create res =
-          net2_ref :=
+          t.net2 <-
             Deferred.map res ~f:(fun (n, _, _, _) ->
                 ( match
                     Sys.getenv "MINA_LIBP2P_HELPER_RESTART_INTERVAL_BASE"
@@ -480,7 +508,7 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
                 | None ->
                     () ) ;
                 n) ;
-          subscription_ref := Deferred.map res ~f:(fun (_, s, _, _) -> s) ;
+          t.subscription <- Deferred.map res ~f:(fun (_, s, _, _) -> s) ;
           upon res (fun (_, _, m, me) ->
               (* This is a hack so that we keep the same keypair across restarts. *)
               config.keypair <- Some me ;
@@ -489,73 +517,24 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
               don't_wait_for (Strict_pipe.transfer m message_writer ~f:Fn.id))
         and start_libp2p () =
           let libp2p =
-            create_libp2p config rpc_handlers first_peer_ivar
-              high_connectivity_ivar ~added_seeds ~pids
+            create_libp2p config rpc_handlers t.first_peer_ivar
+              t.high_connectivity_ivar
+              ~initial_gating_config:t.connection_gating ~added_seeds ~pids
               ~on_unexpected_termination:restart_libp2p
           in
           on_libp2p_create libp2p ; Deferred.ignore_m libp2p
         and restart_libp2p () = don't_wait_for (start_libp2p ()) in
         don't_wait_for
           (Strict_pipe.Reader.iter restarts_r ~f:(fun () ->
-               let%bind n = !net2_ref in
+               let%bind n = t.net2 in
                let%bind () = Mina_net2.shutdown n in
-               restart_libp2p () ; !net2_ref >>| ignore)) ;
+               restart_libp2p () ; t.net2 >>| ignore)) ;
         start_libp2p ()
       in
-      let ban_configuration =
-        ref { Mina_net2.banned_peers = []; trusted_peers = []; isolate = false }
-      in
-      let do_ban (banned_peer, expiration) =
-        don't_wait_for
-          ( Clock.at expiration
-          >>= fun () ->
-          let%bind net2 = !net2_ref in
-          ban_configuration :=
-            { !ban_configuration with
-              banned_peers =
-                List.filter !ban_configuration.banned_peers ~f:(fun p ->
-                    not (Peer.equal p banned_peer))
-            } ;
-          Mina_net2.set_connection_gating_config net2 !ban_configuration
-          |> Deferred.ignore_m ) ;
-        (let%bind net2 = !net2_ref in
-         ban_configuration :=
-           { !ban_configuration with
-             banned_peers = banned_peer :: !ban_configuration.banned_peers
-           } ;
-         Mina_net2.set_connection_gating_config net2 !ban_configuration)
-        |> Deferred.ignore_m
-      in
-      let%map () =
-        Deferred.List.iter (Trust_system.peer_statuses config.trust_system)
-          ~f:(function
-          | ( addr
-            , { banned = Trust_system.Banned_status.Banned_until expiration; _ }
-            ) ->
-              do_ban (addr, expiration)
-          | _ ->
-              Deferred.unit)
-      in
-      let ban_reader, ban_writer = Linear_pipe.create () in
-      don't_wait_for
-        (let%map () =
-           Strict_pipe.Reader.iter
-             (Trust_system.ban_pipe config.trust_system)
-             ~f:do_ban
-         in
-         Linear_pipe.close ban_writer) ;
-      let t =
-        { config
-        ; added_seeds
-        ; net2 = net2_ref
-        ; first_peer_ivar
-        ; high_connectivity_ivar
-        ; subscription = subscription_ref
-        ; message_reader
-        ; ban_reader
-        ; restart_helper = (fun () -> Strict_pipe.Writer.write restarts_w ())
-        }
-      in
+      List.iter initial_bans ~f:(fun (peer, expiration) ->
+          don't_wait_for
+            (let%bind () = Clock.at expiration in
+             unban_peer t peer)) ;
       Clock.every' peers_snapshot_max_staleness (fun () ->
           let%map peers = peers t in
           Mina_metrics.(
@@ -568,10 +547,10 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
       t
 
     let set_node_status t data =
-      !(t.net2) >>= Fn.flip Mina_net2.set_node_status data
+      t.net2 >>= Fn.flip Mina_net2.set_node_status data
 
     let get_peer_node_status t peer =
-      !(t.net2)
+      t.net2
       >>= Fn.flip Mina_net2.get_peer_node_status
             (Peer.to_multiaddr_string peer |> Mina_net2.Multiaddr.of_string)
 
@@ -580,7 +559,7 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
     let add_peer t p ~is_seed =
       let open Mina_net2 in
       if is_seed then Hash_set.add t.added_seeds p ;
-      !(t.net2)
+      t.net2
       >>= Fn.flip (add_peer ~is_seed)
             (Multiaddr.of_string (Peer.to_multiaddr_string p))
 
@@ -742,7 +721,7 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
 
     let query_peer ?heartbeat_timeout ?timeout t (peer_id : Peer.Id.t) rpc
         rpc_input =
-      let%bind net2 = !(t.net2) in
+      let%bind net2 = t.net2 in
       match%bind
         Mina_net2.open_stream net2 ~protocol:rpc_transport_proto ~peer:peer_id
       with
@@ -759,7 +738,7 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
 
     let query_peer' (type q r) ?how ?heartbeat_timeout ?timeout t
         (peer_id : Peer.Id.t) (rpc : (q, r) rpc) (qs : q list) =
-      let%bind net2 = !(t.net2) in
+      let%bind net2 = t.net2 in
       match%bind
         Mina_net2.open_stream net2 ~protocol:rpc_transport_proto ~peer:peer_id
       with
@@ -790,8 +769,8 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
 
     let broadcast t msg =
       don't_wait_for
-        (let%bind net2 = !(t.net2) in
-         let%bind subscription = !(t.subscription) in
+        (let%bind net2 = t.net2 in
+         let%bind subscription = t.subscription in
          Mina_net2.Pubsub.publish net2 subscription msg)
 
     let on_first_connect t ~f = Deferred.map (Ivar.read t.first_peer_ivar) ~f
@@ -801,14 +780,12 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
 
     let received_message_reader t = t.message_reader
 
-    let ban_notification_reader t = t.ban_reader
-
     let connection_gating t =
-      let%map net2 = !(t.net2) in
+      let%map net2 = t.net2 in
       Mina_net2.connection_gating_config net2
 
     let set_connection_gating t config =
-      let%bind net2 = !(t.net2) in
+      let%bind net2 = t.net2 in
       Mina_net2.set_connection_gating_config net2 config
 
     let restart_helper t = t.restart_helper ()

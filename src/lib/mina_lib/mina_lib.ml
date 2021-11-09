@@ -1906,22 +1906,6 @@ let create ?wallets (config : Config.t) =
             (Strict_pipe.transfer
                (Mina_networking.states net)
                external_transitions_writer ~f:ident) ;
-          (* FIXME #4093: augment ban_notifications with a Peer.ID so we can implement ban_notify
-             trace_task "ban notification loop" (fun () ->
-              Linear_pipe.iter (Mina_networking.ban_notification_reader net)
-                ~f:(fun notification ->
-                  let open Gossip_net in
-                  let peer = notification.banned_peer in
-                  let banned_until = notification.banned_until in
-                  (* if RPC call fails, will be logged in gossip net code *)
-                  let%map _ =
-                    Mina_networking.ban_notify net peer banned_until
-                  in
-                  () ) ) ; *)
-          don't_wait_for
-            (Linear_pipe.iter
-               (Mina_networking.ban_notification_reader net)
-               ~f:(Fn.const Deferred.unit)) ;
           let snark_pool_config =
             Network_pool.Snark_pool.Resource_pool.make_config ~verifier
               ~trust_system:config.trust_system

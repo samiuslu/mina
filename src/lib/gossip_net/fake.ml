@@ -19,7 +19,6 @@ end
 
 module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
   S with module Rpc_intf := Rpc_intf = struct
-  open Intf
   open Rpc_intf
 
   module Network = struct
@@ -128,8 +127,6 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
           , Strict_pipe.crash Strict_pipe.buffered
           , unit )
           Strict_pipe.Writer.t
-      ; ban_notification_reader : ban_notification Linear_pipe.Reader.t
-      ; ban_notification_writer : ban_notification Linear_pipe.Writer.t
       }
 
     let rpc_hook t rpc_handlers =
@@ -172,9 +169,6 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
       let received_message_reader, received_message_writer =
         Strict_pipe.(create (Buffered (`Capacity 5, `Overflow Crash)))
       in
-      let ban_notification_reader, ban_notification_writer =
-        Linear_pipe.create ()
-      in
       let t =
         { network
         ; me
@@ -187,8 +181,6 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
                 { banned_peers = []; trusted_peers = []; isolate = false }
         ; received_message_reader
         ; received_message_writer
-        ; ban_notification_reader
-        ; ban_notification_writer
         }
       in
       Network.(
@@ -210,6 +202,10 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
       Deferred.Or_error.error_string "fake node status: Not implemented"
 
     let add_peer _ (_p : Peer.t) ~is_seed:_ = Deferred.return (Ok ())
+
+    let ban_peer _ _ = Deferred.unit
+
+    let unban_peer _ _ = Deferred.unit
 
     let initial_peers t =
       Hashtbl.data t.peer_table
@@ -234,9 +230,6 @@ module Make (Rpc_intf : Mina_base.Rpc_intf.Rpc_interface_intf) :
 
     let received_message_reader { received_message_reader; _ } =
       received_message_reader
-
-    let ban_notification_reader { ban_notification_reader; _ } =
-      ban_notification_reader
 
     let query_peer ?heartbeat_timeout:_ ?timeout:_ t peer rpc query =
       Network.call_rpc t.network t.peer_table ~sender_id:t.me.peer_id

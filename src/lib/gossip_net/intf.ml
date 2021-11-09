@@ -31,6 +31,10 @@ module type Gossip_net_intf = sig
 
   val add_peer : t -> Peer.t -> is_seed:bool -> unit Deferred.Or_error.t
 
+  val ban_peer : t -> Peer.t -> unit Deferred.t
+
+  val unban_peer : t -> Peer.t -> unit Deferred.t
+
   val connection_gating : t -> Mina_net2.connection_gating Deferred.t
 
   val set_connection_gating :
@@ -77,6 +81,4 @@ module type Gossip_net_intf = sig
        t
     -> (Message.msg Envelope.Incoming.t * Mina_net2.Validation_callback.t)
        Strict_pipe.Reader.t
-
-  val ban_notification_reader : t -> ban_notification Linear_pipe.Reader.t
 end

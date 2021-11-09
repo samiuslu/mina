@@ -260,8 +260,6 @@ val get_staged_ledger_aux_and_pending_coinbases_at_hash :
      * Mina_state.Protocol_state.value list )
      Deferred.Or_error.t
 
-val ban_notify : t -> Network_peer.Peer.t -> Time.t -> unit Deferred.Or_error.t
-
 val snark_pool_diffs :
      t
   -> ( Snark_pool.Resource_pool.Diff.t Envelope.Incoming.t
@@ -309,9 +307,6 @@ val connection_gating_config : t -> Mina_net2.connection_gating Deferred.t
 
 val set_connection_gating_config :
   t -> Mina_net2.connection_gating -> Mina_net2.connection_gating Deferred.t
-
-val ban_notification_reader :
-  t -> Gossip_net.ban_notification Linear_pipe.Reader.t
 
 val create :
      Config.t
