@@ -33,6 +33,7 @@ module Config = struct
     ; mina_peer_exchange : bool
     ; seed_peer_list_url : Uri.t option
     ; min_connections : int
+    ; time_controller : Block_time.Controller.t
     ; max_connections : int
     ; validation_queue_size : int
     ; mutable keypair : Mina_net2.Keypair.t option
@@ -390,7 +391,9 @@ module Make
                   match Envelope.Incoming.data env with
                   | Message.New_state state ->
                       SinksImpl.Block_sink.push sinks.sink_block
-                        (Envelope.Incoming.map ~f:(fun _ -> state) env, vc)
+                        ( Envelope.Incoming.map ~f:(fun _ -> state) env
+                        , Block_time.now config.time_controller
+                        , vc )
                   | Message.Transaction_pool_diff diff ->
                       SinksImpl.Tx_sink.push sinks.sink_tx
                         (Envelope.Incoming.map ~f:(fun _ -> diff) env, vc)
