@@ -181,6 +181,11 @@ module Status = struct
     [@@deriving to_yojson, bin_io_unversioned]
   end
 
+  module Metrics = struct
+    type t = { ban_notify_rpcs_sent : int; ban_notify_rpcs_received : int }
+    [@@deriving to_yojson, bin_io_unversioned, fields]
+  end
+
   module Make_entries (FieldT : sig
     type 'a t
 
@@ -386,6 +391,19 @@ module Status = struct
         |> digest_entries ~title:""
       in
       option_entry "Catchup status" ~f:render
+
+    let metrics =
+      let render conf =
+        let fmt_field name op field = [ (name, op (Field.get field conf)) ] in
+        Metrics.Fields.to_list
+          ~ban_notify_rpcs_sent:(fmt_field "ban_notify_rpcs_sent" Int.to_string)
+          ~ban_notify_rpcs_received:
+            (fmt_field "ban_notify_rpcs_received" Int.to_string)
+        |> List.concat
+        |> List.map ~f:(fun (s, v) -> ("\t" ^ s, v))
+        |> digest_entries ~title:""
+      in
+      map_entry "Metrics" ~f:render
   end
 
   type t =
@@ -418,6 +436,7 @@ module Status = struct
     ; consensus_mechanism : string
     ; consensus_configuration : Consensus.Configuration.Stable.Latest.t
     ; addrs_and_ports : Node_addrs_and_ports.Display.Stable.Latest.t
+    ; metrics : Metrics.t
     }
   [@@deriving to_yojson, bin_io_unversioned, fields]
 
@@ -435,7 +454,7 @@ module Status = struct
       ~coinbase_receiver ~histograms ~consensus_time_best_tip
       ~global_slot_since_genesis_best_tip ~consensus_time_now
       ~consensus_mechanism ~consensus_configuration ~next_block_production
-      ~snark_work_fee ~addrs_and_ports ~catchup_status
+      ~snark_work_fee ~addrs_and_ports ~catchup_status ~metrics
     |> List.filter_map ~f:Fn.id
 
   let to_text (t : t) =

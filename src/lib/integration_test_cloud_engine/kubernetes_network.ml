@@ -41,19 +41,27 @@ module Node = struct
     in
     Util.run_cmd_exn cwd "sh" [ "-c"; kubectl_cmd ]
 
-  let run_in_container node ~container_id ~cmd =
+  let run_in_container ?(env_vars = []) node ~container_id ~cmd =
     let base_args = base_kube_args node in
     let base_kube_cmd = "kubectl " ^ String.concat ~sep:" " base_args in
+    let env =
+      List.map ~f:(fun (k, v) -> sprintf "%s=%s" k v) env_vars
+      |> String.concat ~sep:" "
+    in
+    let cmd_with_env =
+      match env with "" -> cmd | _ -> sprintf "env %s %s" env cmd
+    in
     let kubectl_cmd =
-      Printf.sprintf
-        "%s -c %s exec -i $( %s get pod -l \"app=%s\" -o name) -- %s"
-        base_kube_cmd container_id base_kube_cmd node.pod_id cmd
+      sprintf "%s -c %s exec -i $( %s get pod -l \"app=%s\" -o name) -- %s"
+        base_kube_cmd container_id base_kube_cmd node.pod_id cmd_with_env
     in
     let%bind.Deferred cwd = Unix.getcwd () in
     Util.run_cmd_exn cwd "sh" [ "-c"; kubectl_cmd ]
 
-  let run_in_container_unit node ~container_id ~cmd =
-    let%map (_output : string) = run_in_container node ~container_id ~cmd in
+  let run_in_container_unit ?(env_vars = []) node ~container_id ~cmd =
+    let%map (_output : string) =
+      run_in_container ~env_vars node ~container_id ~cmd
+    in
     ()
 
   (* we dont use this functionality atm but if we need logic that runs commands in all containers a whole pod at a time, here it is *)
@@ -75,7 +83,7 @@ module Node = struct
      let result_list = List.map container_list ~f:call_run in
      List.fold result_list ~init:(Deferred.return "") ~f:foldh *)
 
-  let start ~fresh_state node : unit Malleable_error.t =
+  let start ~fresh_state ?(env_vars = []) node : unit Malleable_error.t =
     let open Deferred.Let_syntax in
     let%bind () =
       run_in_container_unit node ~container_id:node.mina_container_id
@@ -88,7 +96,7 @@ module Node = struct
       else Deferred.return ()
     in
     let%bind () =
-      run_in_container_unit node ~container_id:node.mina_container_id
+      run_in_container_unit ~env_vars node ~container_id:node.mina_container_id
         ~cmd:"/start.sh"
     in
     Malleable_error.return ()
@@ -206,6 +214,19 @@ module Node = struct
       }
     |}]
 
+    module Query_metrics =
+    [%graphql
+    {|
+      query {
+        daemonStatus {
+          metrics {
+            banNotifyRpcsSent
+            banNotifyRpcsReceived
+          }
+        }
+      }
+    |}]
+
     module Best_chain =
     [%graphql
     {|
@@ -291,6 +312,29 @@ module Node = struct
       self_id
       (String.concat ~sep:" " peer_ids) ;
     return (self_id, peer_ids)
+
+  let get_metrics ~logger t =
+    let open Deferred.Or_error.Let_syntax in
+    [%log info] "Getting node's metrics"
+      ~metadata:
+        [ ("namespace", `String t.namespace); ("pod_id", `String t.pod_id) ] ;
+    let query_obj = Graphql.Query_metrics.make () in
+    let%bind query_result_obj =
+      exec_graphql_request ~logger ~node:t ~query_name:"query_metrics" query_obj
+    in
+    [%log info] "get_metrics, finished exec_graphql_request" ;
+    let bn_sent = query_result_obj#daemonStatus#metrics#banNotifyRpcsSent in
+    let bn_received =
+      query_result_obj#daemonStatus#metrics#banNotifyRpcsReceived
+    in
+    [%log info]
+      "get_metrics, result of graphql query (ban_notify_rpcs_sent, \
+       ban_notify_rpcs_received) (%d, %d)"
+      bn_sent bn_received ;
+    return
+      { Intf.ban_notify_rpcs_sent = bn_sent
+      ; ban_notify_rpcs_received = bn_received
+      }
 
   let must_get_peer_id ~logger t =
     get_peer_id ~logger t |> Deferred.bind ~f:Malleable_error.or_hard_error

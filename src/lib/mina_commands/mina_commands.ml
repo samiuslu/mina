@@ -374,6 +374,14 @@ let get_status ~flag t =
     | _ ->
         None
   in
+  let read_int_gauge (_, g) = Float.to_int @@ Mina_metrics.Gauge.value g in
+  let metrics =
+    let open Mina_metrics.Network in
+    { Daemon_rpcs.Types.Status.Metrics.ban_notify_rpcs_received =
+        read_int_gauge ban_notify_rpcs_received
+    ; ban_notify_rpcs_sent = read_int_gauge ban_notify_rpcs_sent
+    }
+  in
   { Daemon_rpcs.Types.Status.num_accounts
   ; sync_status
   ; catchup_status
@@ -406,6 +414,7 @@ let get_status ~flag t =
   ; consensus_mechanism
   ; consensus_configuration
   ; addrs_and_ports
+  ; metrics
   }
 
 let clear_hist_status ~flag t = Perf_histograms.wipe () ; get_status ~flag t

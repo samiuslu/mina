@@ -5,6 +5,8 @@ open Mina_base
 open Pipe_lib
 open Signature_lib
 
+type metrics_t = { ban_notify_rpcs_sent : int; ban_notify_rpcs_received : int }
+
 (* TODO: malleable error -> or error *)
 
 module Engine = struct
@@ -35,7 +37,11 @@ module Engine = struct
 
       val network_keypair : t -> Network_keypair.t option
 
-      val start : fresh_state:bool -> t -> unit Malleable_error.t
+      val start :
+           fresh_state:bool
+        -> ?env_vars:(string * string) list
+        -> t
+        -> unit Malleable_error.t
 
       val stop : t -> unit Malleable_error.t
 
@@ -73,6 +79,9 @@ module Engine = struct
            logger:Logger.t
         -> t
         -> (string * string list) Async_kernel.Deferred.Or_error.t
+
+      val get_metrics :
+        logger:Logger.t -> t -> metrics_t Async_kernel.Deferred.Or_error.t
 
       val must_get_peer_id :
         logger:Logger.t -> t -> (string * string list) Malleable_error.t
